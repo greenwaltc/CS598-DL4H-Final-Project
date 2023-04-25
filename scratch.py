@@ -190,6 +190,91 @@ class AttentionPooling(nn.Module):
         return attn_output
 
 
+class MultiHeadAttention(nn.Module):
+    def __init__(self, direction, dropout, num_units, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.direction = direction
+        self.dropout = dropout
+        self.num_units = num_units
+        self.q_linear = nn.Linear(num_units, num_units, bias=False)
+        self.k_linear = nn.Linear(num_units, num_units, bias=False)
+        self.v_linear = nn.Linear(num_units, num_units, bias=False)
+
+    def forward(self, inputs):
+
+        # because of self-attention, queries and keys is equal to inputs
+        input_tensor, input_mask = inputs
+        queries = input_tensor
+        keys = input_tensor
+
+        # Linear projections
+        Q = self.q_linear(queries)  # (N, L_q, d)
+        K = self.k_linear(keys)  # (N, L_k, d)
+        V = self.v_linear(keys)  # (N, L_k, d)
+
+        # print('Q shape: ', Q.get_shape())
+
+        # Split and concat
+        assert self.num_units % self.num_heads == 0
+        Q_ = torch.cat(torch.split(Q, self.num_units // self.num_heads, dim=2), dim=0)  # (h*N, L_q, d/h)
+        K_ = torch.cat(torch.split(K, self.num_units // self.num_heads, dim=2), dim=0)  # (h*N, L_k, d/h)
+        V_ = torch.cat(torch.split(V, self.num_units // self.num_heads, dim=2), dim=0)  # (h*N, L_k, d/h)
+
+        # Multiplication
+        outputs = torch.matmul(Q_, torch.permute(K_, [0, 2, 1]))  # (h*N, L_q, L_k)
+
+        # Scale
+        outputs = outputs / (list(K_.shape)[-1] ** 0.5)  # (h*N, L_q, L_k)
+
+        # Key Masking
+        key_masks = torch.sign(torch.sum(torch.abs(K_), dim=-1))  # (h*N, T_k)
+        key_masks = torch.unsqueeze(key_masks, 1)  # (h*N, 1, T_k)
+        key_masks = torch.tile(key_masks, [1, list(Q_.shape)[1], 1])  # (h*N, T_q, T_k)
+
+        # Apply masks to outputs
+        paddings = torch.ones_like(outputs) * (-2 ** 32 + 1)  # exp mask
+        outputs = torch.where(key_masks == 0, paddings, outputs)  # (h*N, T_q, T_k)
+
+        n_visits = list(input_tensor.shape)[1]
+        sw_indices = torch.arange(0, n_visits, dtype=torch.int32)
+        sw_col, sw_row = torch.meshgrid(sw_indices, sw_indices)
+        if self.direction == MaskDirection.DIAGONAL:
+            # shape of (n_visits, n_visits)
+            attention_mask = (torch.diag(- torch.ones([n_visits], dtype=torch.int32)) + 1).bool()
+        elif self.direction == MaskDirection.FORWARD:
+            attention_mask = torch.greater(sw_row, sw_col)  # shape of (n_visits, n_visits)
+        else: # MaskDirection.BACKWARD
+            attention_mask = torch.greater(sw_col, sw_row)  # shape of (n_visits, n_visits)
+        adder = (1.0 - attention_mask.type(outputs.dtype)) * -10000.0
+        outputs += adder
+
+        # softmax
+        outputs = F.softmax(outputs)  # (h*N, T_q, T_k)
+
+        # Query Masking
+        query_masks = torch.sign(torch.sum(torch.abs(Q_), dim=-1))  # (h*N, T_q)
+        query_masks = torch.unsqueeze(query_masks, -1)  # (h*N, T_q, 1)
+        query_masks = torch.tile(query_masks, [1, 1, list(K_.shape)[1]])  # (h*N, T_q, T_k)
+
+        # Apply masks to outputs
+        outputs = outputs * query_masks
+
+        # Dropouts
+        outputs = F.dropout(outputs, p=self.dropout)
+        # Weighted sum
+        outputs = torch.matmul(outputs, V_)  # ( h*N, T_q, C/h)
+
+        # Restore shape
+        outputs = torch.cat(torch.split(outputs, outputs.shape[0] // self.num_heads, dim=0), dim=2)  # (N, L_q, d)
+
+        # input padding
+        val_mask = torch.unsqueeze(input_mask, -1)
+        outputs = torch.multiply(outputs, (~val_mask).float())
+
+        return outputs
+
+
 class MaskEnc(nn.Module):
     def __init__(
             self,
@@ -204,12 +289,19 @@ class MaskEnc(nn.Module):
         self.embedding_dim = embedding_dim
         self.temporal_mask_direction = temporal_mask_direction
 
-        self.attention = nn.MultiheadAttention(
-                embed_dim=embedding_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=batch_first
-            )
+        # self.attention = nn.MultiheadAttention(
+        #         embed_dim=embedding_dim,
+        #         num_heads=num_heads,
+        #         dropout=dropout,
+        #         batch_first=batch_first
+        #     )
+
+        self.attention = MultiHeadAttention(
+            direction=temporal_mask_direction,
+            dropout=dropout,
+            num_units=embedding_dim,
+            num_heads=num_heads
+        )
 
         self.fc = nn.Sequential(
             nn.Linear(embedding_dim, embedding_dim),
@@ -223,14 +315,14 @@ class MaskEnc(nn.Module):
 
     def forward(self, inputs):
         x, key_padding_mask = inputs
-        numerical_key_padding_mask = torch.full(key_padding_mask.shape, VERY_NEGATIVE_NUMBER)
-        numerical_key_padding_mask[~key_padding_mask] = 0
-        attn_mask = self._make_temporal_mask(x.shape[1])
 
-        attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
-                                                          attn_mask=attn_mask)
-        attn_output = torch.nan_to_num(attn_output, nan=0)
-        attn_output = attn_output * (~key_padding_mask.unsqueeze(-1)).float()
+        attn_output = self.attention((x, key_padding_mask))
+        if torch.any(torch.isnan(attn_output)):
+            print("whoops")
+            for n, p in self.attention.named_parameters():
+                if torch.any(torch.isnan(p)):
+                    print(n)
+                    print(p)
         attn_output = self.layer_norm1(x + attn_output)
         out = self.fc(attn_output)
         out = out * (~key_padding_mask.unsqueeze(-1)).float()
@@ -239,15 +331,41 @@ class MaskEnc(nn.Module):
 
         return out, key_padding_mask
 
+    # def forward(self, inputs):
+    #     x, key_padding_mask = inputs
+    #     numerical_key_padding_mask = torch.full(key_padding_mask.shape, -1000).float()
+    #     numerical_key_padding_mask[~key_padding_mask] = 0
+    #     attn_mask = self._make_temporal_mask(x.shape[1])
+    #
+    #     attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
+    #                                                       attn_mask=attn_mask)
+    #     if torch.any(torch.isnan(attn_output)):
+    #         print("whoops")
+    #         for n, p in self.attention.named_parameters():
+    #             if torch.any(torch.isnan(p)):
+    #                 print(n)
+    #                 print(p)
+    #     attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
+    #                                                       attn_mask=attn_mask)
+    #     attn_output = torch.nan_to_num(attn_output, nan=0)
+    #     attn_output = attn_output * (~key_padding_mask.unsqueeze(-1)).float()
+    #     attn_output = self.layer_norm1(x + attn_output)
+    #     out = self.fc(attn_output)
+    #     out = out * (~key_padding_mask.unsqueeze(-1)).float()
+    #     out = self.layer_norm2(out + attn_output)
+    #     out = out * (~key_padding_mask.unsqueeze(-1)).float()
+    #
+    #     return out, key_padding_mask
+
     def _make_temporal_mask(self, n: int) -> Optional[torch.Tensor]:
         if self.temporal_mask_direction == MaskDirection.NONE:
             return None
         if self.temporal_mask_direction == MaskDirection.FORWARD:
-            return torch.tril(torch.full((n, n), VERY_NEGATIVE_NUMBER))
+            return torch.tril(torch.full((n, n), -10000)).fill_diagonal_(0).float()
         if self.temporal_mask_direction == MaskDirection.BACKWARD:
-            return torch.triu(torch.full((n, n), VERY_NEGATIVE_NUMBER))
+            return torch.triu(torch.full((n, n), -10000)).fill_diagonal_(0).float()
         if self.temporal_mask_direction == MaskDirection.DIAGONAL:
-            return torch.zeros(n, n).fill_diagonal_(VERY_NEGATIVE_NUMBER)
+            return torch.zeros(n, n).fill_diagonal_(-10000).float()
 
 
 class BiteNet(nn.Module):
@@ -322,8 +440,6 @@ class BiteNet(nn.Module):
         visits_mask = ~(visits_mask.bool())
 
         u_fw = self.visit_attn_fw((code_attn, visits_mask))
-        for p in self.visit_attn_fw.parameters():
-            print(p)
         u_bw = self.visit_attn_bw((code_attn, visits_mask))
         u_bi = torch.cat([u_fw, u_bw], dim=-1)
 
@@ -423,8 +539,8 @@ model_dxtx = PyHealthBiteNet(
     embedding_dim=128
 )
 
-data = next(iter(train_loader))
-model_dxtx(**data)
+# data = next(iter(train_loader))
+# model_dxtx(**data)
 
 
 trainer_dxtx = Trainer(model=model_dxtx)
@@ -439,3 +555,4 @@ trainer_dxtx.train(
 while True:
     data = next(iter(train_loader))
     model_dxtx(**data)
+    print()
