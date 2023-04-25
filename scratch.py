@@ -229,11 +229,13 @@ class MaskEnc(nn.Module):
 
         attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
                                                           attn_mask=attn_mask)
+        attn_output = torch.nan_to_num(attn_output, nan=0)
         attn_output = attn_output * (~key_padding_mask.unsqueeze(-1)).float()
         attn_output = self.layer_norm1(x + attn_output)
         out = self.fc(attn_output)
         out = out * (~key_padding_mask.unsqueeze(-1)).float()
         out = self.layer_norm2(out + attn_output)
+        out = out * (~key_padding_mask.unsqueeze(-1)).float()
 
         return out, key_padding_mask
 
@@ -320,6 +322,8 @@ class BiteNet(nn.Module):
         visits_mask = ~(visits_mask.bool())
 
         u_fw = self.visit_attn_fw((code_attn, visits_mask))
+        for p in self.visit_attn_fw.parameters():
+            print(p)
         u_bw = self.visit_attn_bw((code_attn, visits_mask))
         u_bi = torch.cat([u_fw, u_bw], dim=-1)
 
