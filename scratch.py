@@ -142,9 +142,9 @@ class MaskedLayerNorm(nn.Module):
         self.bias = nn.parameter.Parameter(torch.zeros(normalized_shape, dtype=torch.float32))
         self.normalized_shape = normalized_shape
 
-    def forward(self, x: torch.Tensor, eps = 1e-5):
-        mean = torch.nanmean(x, dim=-1, keepdim=True)
-        variance = torch.nanmean(torch.square(x - mean), dim=-1, keepdim=True)
+    def forward(self, x: torch.Tensor, eps=1e-5):
+        mean = torch.mean(x, dim=-1, keepdim=True)
+        variance = torch.mean(torch.square(x - mean), dim=-1, keepdim=True)
         norm_x = (x - mean) * torch.rsqrt(variance + eps)
         return norm_x * self.scale + self.bias
 
@@ -180,11 +180,13 @@ class AttentionPooling(nn.Module):
             nn.Linear(embedding_size, embedding_size)
         )
 
-    def forward(self, input):
-        x = self.fc(input)
-        x = torch.nan_to_num(x, nan=VERY_NEGATIVE_NUMBER)
+    def forward(self, inputs):
+        x, mask = inputs
+        x = self.fc(x)
+        x[mask] = VERY_NEGATIVE_NUMBER
         soft = F.softmax(x, dim=1)
-        attn_output = torch.nansum(soft * input, 1)
+        x[mask] = 0
+        attn_output = torch.sum(soft * x, 1)
         return attn_output
 
 
@@ -221,12 +223,16 @@ class MaskEnc(nn.Module):
 
     def forward(self, inputs):
         x, key_padding_mask = inputs
+        numerical_key_padding_mask = torch.full(key_padding_mask.shape, VERY_NEGATIVE_NUMBER)
+        numerical_key_padding_mask[~key_padding_mask] = 0
         attn_mask = self._make_temporal_mask(x.shape[1])
-        x = torch.nan_to_num(x, nan=0)
 
-        attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=key_padding_mask, attn_mask=attn_mask)
+        attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
+                                                          attn_mask=attn_mask)
+        attn_output = attn_output * (~key_padding_mask.unsqueeze(-1)).float()
         attn_output = self.layer_norm1(x + attn_output)
         out = self.fc(attn_output)
+        out = out * (~key_padding_mask.unsqueeze(-1)).float()
         out = self.layer_norm2(out + attn_output)
 
         return out, key_padding_mask
@@ -235,11 +241,11 @@ class MaskEnc(nn.Module):
         if self.temporal_mask_direction == MaskDirection.NONE:
             return None
         if self.temporal_mask_direction == MaskDirection.FORWARD:
-            return torch.tril(torch.ones(n,n)).bool()
+            return torch.tril(torch.full((n, n), VERY_NEGATIVE_NUMBER))
         if self.temporal_mask_direction == MaskDirection.BACKWARD:
-            return torch.triu(torch.ones(n,n)).bool()
+            return torch.triu(torch.full((n, n), VERY_NEGATIVE_NUMBER))
         if self.temporal_mask_direction == MaskDirection.DIAGONAL:
-            return torch.ones(n,n).fill_diagonal_(0).bool()
+            return torch.zeros(n, n).fill_diagonal_(VERY_NEGATIVE_NUMBER)
 
 
 class BiteNet(nn.Module):
@@ -280,9 +286,9 @@ class BiteNet(nn.Module):
             self.visit_attn_bw.append(_make_mask_enc_block(MaskDirection.BACKWARD))
 
         # Attention pooling layers
-        self.code_attn_pooling = AttentionPooling(embedding_dim)
-        self.visit_attn_bw_pooling = AttentionPooling(embedding_dim)
-        self.visit_attn_fw_pooling = AttentionPooling(embedding_dim)
+        self.code_attn.append(AttentionPooling(embedding_dim))
+        self.visit_attn_fw.append(AttentionPooling(embedding_dim))
+        self.visit_attn_bw.append(AttentionPooling(embedding_dim))
 
         self.fc = nn.Sequential(
             nn.Linear(2*embedding_dim, embedding_dim),
@@ -305,8 +311,7 @@ class BiteNet(nn.Module):
         # input mask, reshape 3 dimension to 2
         flattened_codes_mask = self.flatten(codes_mask, 1)
 
-        code_attn, _ = self.code_attn((flattened_codes, flattened_codes_mask))
-        code_attn = self.code_attn_pooling(code_attn)
+        code_attn = self.code_attn((flattened_codes, flattened_codes_mask))
         code_attn = self.unflatten(code_attn, embedded_codes, self.embedding_dim)
 
         if self.use_intervals:
@@ -314,13 +319,10 @@ class BiteNet(nn.Module):
 
         visits_mask = ~(visits_mask.bool())
 
-        u_fw, _ = self.visit_attn_fw((code_attn, visits_mask))
-        u_fw = self.visit_attn_fw_pooling(u_fw)
-
-        u_bw, _ = self.visit_attn_bw((code_attn, visits_mask))
-        u_bw = self.visit_attn_bw_pooling(u_bw)
-
+        u_fw = self.visit_attn_fw((code_attn, visits_mask))
+        u_bw = self.visit_attn_bw((code_attn, visits_mask))
         u_bi = torch.cat([u_fw, u_bw], dim=-1)
+
         s = self.fc(u_bi)
         return s
 
@@ -407,10 +409,6 @@ class PyHealthBiteNet(BaseModel):
         loss = self.get_loss_function()(logits, y_true)
         y_prob = self.prepare_y_prob(logits)
 
-        for p, name in self.named_parameters():
-            print(name)
-            print(p)
-
         return {"loss": loss, "y_prob": y_prob, "y_true": y_true}
 
 model_dxtx = PyHealthBiteNet(
@@ -418,7 +416,7 @@ model_dxtx = PyHealthBiteNet(
     feature_keys = ['procedures', 'conditions', 'intervals'],
     label_key = "label",
     mode = "binary",
-    embedding_dim=4
+    embedding_dim=128
 )
 
 data = next(iter(train_loader))
