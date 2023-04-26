@@ -1,6 +1,7 @@
 output
 venv
 .idea
+data
 bin
 include
 lib

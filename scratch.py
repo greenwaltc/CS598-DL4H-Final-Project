@@ -23,7 +23,7 @@ data_root = "./data"
 mimic3_ds = MIMIC3Dataset(
         root=data_root,
         tables=["DIAGNOSES_ICD", "PROCEDURES_ICD"],
-        dev=True
+        dev=False
 )
 
 
@@ -129,6 +129,8 @@ VERY_SMALL_NUMBER = 1e-30
 VERY_POSITIVE_NUMBER = VERY_BIG_NUMBER
 VERY_NEGATIVE_NUMBER = -VERY_BIG_NUMBER
 
+device = 'cuda'
+
 class MaskDirection(Enum):
     FORWARD = 'forward'
     BACKWARD = 'backward'
@@ -138,8 +140,8 @@ class MaskDirection(Enum):
 class MaskedLayerNorm(nn.Module):
     def __init__(self, normalized_shape: int):
         super().__init__()
-        self.scale = nn.parameter.Parameter(torch.ones(normalized_shape, dtype=torch.float32))
-        self.bias = nn.parameter.Parameter(torch.zeros(normalized_shape, dtype=torch.float32))
+        self.scale = nn.parameter.Parameter(torch.ones(normalized_shape, dtype=torch.float32, device=device))
+        self.bias = nn.parameter.Parameter(torch.zeros(normalized_shape, dtype=torch.float32, device=device))
         self.normalized_shape = normalized_shape
 
     def forward(self, x: torch.Tensor, eps=1e-5):
@@ -233,15 +235,15 @@ class MultiHeadAttention(nn.Module):
         key_masks = torch.tile(key_masks, [1, list(Q_.shape)[1], 1])  # (h*N, T_q, T_k)
 
         # Apply masks to outputs
-        paddings = torch.ones_like(outputs) * (-2 ** 32 + 1)  # exp mask
+        paddings = torch.ones_like(outputs, device=device) * (-2 ** 32 + 1)  # exp mask
         outputs = torch.where(key_masks == 0, paddings, outputs)  # (h*N, T_q, T_k)
 
         n_visits = list(input_tensor.shape)[1]
-        sw_indices = torch.arange(0, n_visits, dtype=torch.int32)
+        sw_indices = torch.arange(0, n_visits, dtype=torch.int32, device=device)
         sw_col, sw_row = torch.meshgrid(sw_indices, sw_indices)
         if self.direction == MaskDirection.DIAGONAL:
             # shape of (n_visits, n_visits)
-            attention_mask = (torch.diag(- torch.ones([n_visits], dtype=torch.int32)) + 1).bool()
+            attention_mask = (torch.diag(- torch.ones([n_visits], dtype=torch.int32, device=device)) + 1).bool()
         elif self.direction == MaskDirection.FORWARD:
             attention_mask = torch.greater(sw_row, sw_col)  # shape of (n_visits, n_visits)
         else: # MaskDirection.BACKWARD
@@ -317,12 +319,6 @@ class MaskEnc(nn.Module):
         x, key_padding_mask = inputs
 
         attn_output = self.attention((x, key_padding_mask))
-        if torch.any(torch.isnan(attn_output)):
-            print("whoops")
-            for n, p in self.attention.named_parameters():
-                if torch.any(torch.isnan(p)):
-                    print(n)
-                    print(p)
         attn_output = self.layer_norm1(x + attn_output)
         out = self.fc(attn_output)
         out = out * (~key_padding_mask.unsqueeze(-1)).float()
@@ -331,41 +327,15 @@ class MaskEnc(nn.Module):
 
         return out, key_padding_mask
 
-    # def forward(self, inputs):
-    #     x, key_padding_mask = inputs
-    #     numerical_key_padding_mask = torch.full(key_padding_mask.shape, -1000).float()
-    #     numerical_key_padding_mask[~key_padding_mask] = 0
-    #     attn_mask = self._make_temporal_mask(x.shape[1])
-    #
-    #     attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
-    #                                                       attn_mask=attn_mask)
-    #     if torch.any(torch.isnan(attn_output)):
-    #         print("whoops")
-    #         for n, p in self.attention.named_parameters():
-    #             if torch.any(torch.isnan(p)):
-    #                 print(n)
-    #                 print(p)
-    #     attn_output, attn_output_weights = self.attention(x, x, x, key_padding_mask=numerical_key_padding_mask,
-    #                                                       attn_mask=attn_mask)
-    #     attn_output = torch.nan_to_num(attn_output, nan=0)
-    #     attn_output = attn_output * (~key_padding_mask.unsqueeze(-1)).float()
-    #     attn_output = self.layer_norm1(x + attn_output)
-    #     out = self.fc(attn_output)
-    #     out = out * (~key_padding_mask.unsqueeze(-1)).float()
-    #     out = self.layer_norm2(out + attn_output)
-    #     out = out * (~key_padding_mask.unsqueeze(-1)).float()
-    #
-    #     return out, key_padding_mask
-
     def _make_temporal_mask(self, n: int) -> Optional[torch.Tensor]:
         if self.temporal_mask_direction == MaskDirection.NONE:
             return None
         if self.temporal_mask_direction == MaskDirection.FORWARD:
-            return torch.tril(torch.full((n, n), -10000)).fill_diagonal_(0).float()
+            return torch.tril(torch.full((n, n), -10000, device=device)).fill_diagonal_(0).float()
         if self.temporal_mask_direction == MaskDirection.BACKWARD:
-            return torch.triu(torch.full((n, n), -10000)).fill_diagonal_(0).float()
+            return torch.triu(torch.full((n, n), -10000, device=device)).fill_diagonal_(0).float()
         if self.temporal_mask_direction == MaskDirection.DIAGONAL:
-            return torch.zeros(n, n).fill_diagonal_(-10000).float()
+            return torch.zeros(n, n, device=device).fill_diagonal_(-10000).float()
 
 
 class BiteNet(nn.Module):
@@ -536,23 +506,31 @@ model_dxtx = PyHealthBiteNet(
     feature_keys = ['procedures', 'conditions', 'intervals'],
     label_key = "label",
     mode = "binary",
-    embedding_dim=128
+    embedding_dim=128,
+    n_mask_enc_layers=1,
+    use_intervals=False
 )
 
 # data = next(iter(train_loader))
 # model_dxtx(**data)
 
 
-trainer_dxtx = Trainer(model=model_dxtx)
+trainer_dxtx = Trainer(model=model_dxtx, device=device)
 trainer_dxtx.train(
     train_dataloader=train_loader,
     val_dataloader=val_loader,
-    epochs=1,
+    epochs=50,
     monitor="pr_auc",
     optimizer_class=torch.optim.RMSprop
 )
 
-while True:
-    data = next(iter(train_loader))
-    model_dxtx(**data)
-    print()
+# option 1: use our built-in evaluation metric
+score_dxtx = trainer_dxtx.evaluate(test_loader)
+print (score_dxtx)
+
+# option 2: use our pyhealth.metrics to evaluate
+y_true_dxtx, y_prob_dxtx, loss_dxtx = trainer_dxtx.inference(test_loader)
+binary_metrics_fn(y_true_dxtx, y_prob_dxtx, metrics=["pr_auc"])
+
+data = next(iter(train_loader))
+print(model_dxtx(**data))
