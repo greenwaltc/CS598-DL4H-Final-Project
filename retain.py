@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from typing import List, Dict
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class RETAIN(BaseModel):
     def __init__(
             self,
@@ -53,7 +55,7 @@ class RETAIN(BaseModel):
             feature_vals = kwargs[feature_key]
 
             x = self.feat_tokenizers[feature_key].batch_encode_3d(feature_vals, truncation=(False, False))
-            x = torch.tensor(x, dtype=torch.long, device=self.device)
+            x = torch.tensor(x, dtype=torch.long, device=device)
             pad_idx = self.feat_tokenizers[feature_key].vocabulary("<pad>")
 
             # Create the mask

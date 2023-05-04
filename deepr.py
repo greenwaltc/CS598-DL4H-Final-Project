@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 from typing import List, Dict
 
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 class Deepr(BaseModel):
     def __init__(
             self,
@@ -51,7 +53,7 @@ class Deepr(BaseModel):
             feature_vals = kwargs[feature_key]
 
             x = self.feat_tokenizers[feature_key].batch_encode_3d(feature_vals, truncation=(False, False))
-            x = torch.tensor(x, dtype=torch.long, device=self.device)
+            x = torch.tensor(x, dtype=torch.long, device=device)
             pad_idx = self.feat_tokenizers[feature_key].vocabulary("<pad>")
 
             # Create the mask
@@ -65,6 +67,15 @@ class Deepr(BaseModel):
         visit_embeddings = torch.sum(code_embeddings, dim=2)
         codes_mask = torch.cat(masks, dim=2)
         visits_mask = torch.where(torch.sum(codes_mask, dim=-1) != 0, 1, 0)
+
+        seq_len = visit_embeddings.shape[1]
+        if seq_len <= 2:
+            for _ in range(3 - seq_len):
+                batch_size = visit_embeddings.shape[0]
+                visit_embeddings = torch.cat((visit_embeddings,
+                                              torch.zeros(batch_size, 1, self.embedding_dim, device=device)),
+                                             dim=1)
+                visits_mask = torch.cat((visits_mask, torch.zeros(batch_size, 1, device=device)), dim=1)
 
         output = self.deepr(visit_embeddings, visits_mask)
 
