@@ -1,5 +1,5 @@
 from pyhealth.datasets import SampleDataset
-from pyhealth.models import BaseModel
+from pyhealth.models import BaseModel, TransformerLayer
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
