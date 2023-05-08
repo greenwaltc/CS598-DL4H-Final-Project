@@ -80,7 +80,7 @@ class AttentionPooling(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, direction, dropout, n_units, n_heads=4):
+    def __init__(self, direction, dropout, n_units, n_heads=4, use_dir_masks=True):
         super().__init__()
         self.n_heads = n_heads
         self.direction = direction
@@ -89,6 +89,7 @@ class MultiHeadAttention(nn.Module):
         self.k_linear = nn.Linear(n_units, n_units, bias=False)
         self.v_linear = nn.Linear(n_units, n_units, bias=False)
         self.dropout = nn.Dropout(dropout)
+        self.use_dir_masks = use_dir_masks
 
     def forward(self, inputs):
 
@@ -123,18 +124,19 @@ class MultiHeadAttention(nn.Module):
         paddings = torch.ones_like(outputs, device=device) * (-2 ** 32 + 1)  # exp mask
         outputs = torch.where(key_masks == 0, paddings, outputs)  # (h*N, T_q, T_k)
 
-        n_visits = list(input_tensor.shape)[1]
-        sw_indices = torch.arange(0, n_visits, dtype=torch.int32, device=device)
-        sw_col, sw_row = torch.meshgrid(sw_indices, sw_indices)
-        if self.direction == MaskDirection.DIAGONAL:
-            # shape of (n_visits, n_visits)
-            attention_mask = (torch.diag(- torch.ones([n_visits], dtype=torch.int32, device=device)) + 1).bool()
-        elif self.direction == MaskDirection.FORWARD:
-            attention_mask = torch.greater(sw_row, sw_col)  # shape of (n_visits, n_visits)
-        else:  # MaskDirection.BACKWARD
-            attention_mask = torch.greater(sw_col, sw_row)  # shape of (n_visits, n_visits)
-        adder = (1.0 - attention_mask.type(outputs.dtype)) * -10000.0
-        outputs += adder
+        if self.use_dir_masks:
+            n_visits = list(input_tensor.shape)[1]
+            sw_indices = torch.arange(0, n_visits, dtype=torch.int32, device=device)
+            sw_col, sw_row = torch.meshgrid(sw_indices, sw_indices)
+            if self.direction == MaskDirection.DIAGONAL:
+                # shape of (n_visits, n_visits)
+                attention_mask = (torch.diag(- torch.ones([n_visits], dtype=torch.int32, device=device)) + 1).bool()
+            elif self.direction == MaskDirection.FORWARD:
+                attention_mask = torch.greater(sw_row, sw_col)  # shape of (n_visits, n_visits)
+            else:  # MaskDirection.BACKWARD
+                attention_mask = torch.greater(sw_col, sw_row)  # shape of (n_visits, n_visits)
+            adder = (1.0 - attention_mask.type(outputs.dtype)) * -10000.0
+            outputs += adder
 
         # softmax
         outputs = F.softmax(outputs, -1)  # (h*N, T_q, T_k)
@@ -188,18 +190,21 @@ class MaskEnc(nn.Module):
             n_heads: int,
             dropout: float = 0.1,
             temporal_mask_direction: MaskDirection = MaskDirection.NONE,
+            use_dir_masks = True
     ):
         super().__init__()
 
         self.embedding_dim = embedding_dim
         self.temporal_mask_direction = temporal_mask_direction
+        self.use_dir_masks = use_dir_masks
 
         self.attention = PrePostProcessingWrapper(
             module=MultiHeadAttention(
                 direction=temporal_mask_direction,
                 dropout=dropout,
                 n_units=embedding_dim,
-                n_heads=n_heads
+                n_heads=n_heads,
+                use_dir_masks=self.use_dir_masks
             ),
             normalized_shape=embedding_dim
         )
@@ -242,13 +247,16 @@ class _BiteNet(nn.Module):
             n_heads: int = 4,
             dropout: float = 0.1,
             n_mask_enc_layers: int = 2,
+            use_attn_pooling=True,
+            use_dir_masks=True
     ):
         super().__init__()
 
         self.embedding_dim = embedding_dim
-
+        self.use_attn_pooling = use_attn_pooling
         self.flatten = Flatten()
         self.unflatten = Unflatten()
+        self.use_dir_masks = use_dir_masks
 
         def _make_mask_enc_block(temporal_mask_direction: MaskDirection = MaskDirection.NONE):
             return MaskEnc(
@@ -256,6 +264,7 @@ class _BiteNet(nn.Module):
                 n_heads=n_heads,
                 dropout=dropout,
                 temporal_mask_direction=temporal_mask_direction,
+                use_dir_masks=self.use_dir_masks
             )
 
         self.code_attn = nn.Sequential()
@@ -266,10 +275,11 @@ class _BiteNet(nn.Module):
             self.visit_attn_fw.append(_make_mask_enc_block(MaskDirection.FORWARD))
             self.visit_attn_bw.append(_make_mask_enc_block(MaskDirection.BACKWARD))
 
-        # Attention pooling layers
-        self.code_attn.append(AttentionPooling(embedding_dim))
-        self.visit_attn_fw.append(AttentionPooling(embedding_dim))
-        self.visit_attn_bw.append(AttentionPooling(embedding_dim))
+        if self.use_attn_pooling:
+            # Attention pooling layers
+            self.code_attn.append(AttentionPooling(embedding_dim))
+            self.visit_attn_fw.append(AttentionPooling(embedding_dim))
+            self.visit_attn_bw.append(AttentionPooling(embedding_dim))
 
         self.fc = nn.Sequential(
             nn.Linear(2 * embedding_dim, embedding_dim),
@@ -293,12 +303,23 @@ class _BiteNet(nn.Module):
         code_attn = self.code_attn((flattened_codes, flattened_codes_mask))
         code_attn = self.unflatten(code_attn, embedded_codes, self.embedding_dim)
 
+        if not self.use_attn_pooling:
+            code_attn *= codes_mask.unsqueeze(-1)
+            code_attn = torch.sum(code_attn, dim=-2)
+
         if embedded_intervals is not None:
             code_attn += embedded_intervals
 
         u_fw = self.visit_attn_fw((code_attn, visits_mask))
+        if not self.use_attn_pooling:
+            u_fw *= visits_mask.unsqueeze(-1)
+            u_fw = torch.sum(u_fw, dim=-2)
+
         u_bw = self.visit_attn_bw((code_attn, visits_mask))
         u_bi = torch.cat([u_fw, u_bw], dim=-1)
+        if not self.use_attn_pooling:
+            u_bi *= visits_mask.unsqueeze(-1)
+            u_bi = torch.sum(u_bi, dim=-2)
 
         s = self.fc(u_bi)
         return s
@@ -312,9 +333,11 @@ class BiteNet(BaseModel):
             label_key: str,
             mode: str,
             embedding_dim: int = 128,
-            n_mask_enc_layers: int = 1,
+            n_mask_enc_layers: int = 2,
             n_heads: int = 4,
             dropout: float = 0.1,
+            use_attn_pooling=True,
+            use_dir_masks=True,
             **kwargs
     ):
         super().__init__(dataset, feature_keys, label_key, mode)
@@ -325,6 +348,8 @@ class BiteNet(BaseModel):
         self.linear_layers = nn.ModuleDict()
         self.label_tokenizer = self.get_label_tokenizer()
         self.embedding_dim = embedding_dim
+        self.use_attn_pooling = use_attn_pooling
+        self.use_dir_masks = use_dir_masks
 
         # self.add_feature_transform_layer will create a transformation layer for each feature
         for feature_key in self.feature_keys:
@@ -340,6 +365,8 @@ class BiteNet(BaseModel):
             n_heads=n_heads,
             dropout=dropout,
             n_mask_enc_layers=n_mask_enc_layers,
+            use_attn_pooling=self.use_attn_pooling,
+            use_dir_masks=self.use_dir_masks
         )
 
         self.fc = nn.Linear(self.embedding_dim, output_size)
