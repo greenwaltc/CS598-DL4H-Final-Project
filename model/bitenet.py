@@ -303,26 +303,28 @@ class _BiteNet(nn.Module):
         flattened_codes_mask = self.flatten(codes_mask, 1)
 
         code_attn = self.code_attn((flattened_codes, flattened_codes_mask))
-        code_attn = self.unflatten(code_attn, embedded_codes, self.embedding_dim)
-
         if not self.use_attn_pooling:
-            code_attn *= codes_mask.unsqueeze(-1)
+            code_attn = code_attn[0]
+            code_attn *= flattened_codes_mask.unsqueeze(-1)
             code_attn = torch.sum(code_attn, dim=-2)
+        code_attn = self.unflatten(code_attn, embedded_codes, self.embedding_dim)
 
         if embedded_intervals is not None:
             code_attn += embedded_intervals
 
         u_fw = self.visit_attn_fw((code_attn, visits_mask))
         if not self.use_attn_pooling:
+            u_fw = u_fw[0]
             u_fw *= visits_mask.unsqueeze(-1)
             u_fw = torch.sum(u_fw, dim=-2)
 
         u_bw = self.visit_attn_bw((code_attn, visits_mask))
-        u_bi = torch.cat([u_fw, u_bw], dim=-1)
         if not self.use_attn_pooling:
-            u_bi *= visits_mask.unsqueeze(-1)
-            u_bi = torch.sum(u_bi, dim=-2)
+            u_bw = u_bw[0]
+            u_bw *= visits_mask.unsqueeze(-1)
+            u_bw = torch.sum(u_bw, dim=-2)
 
+        u_bi = torch.cat([u_fw, u_bw], dim=-1)
         s = self.fc(u_bi)
         return s
 
@@ -403,7 +405,11 @@ class BiteNet(BaseModel):
         codes_mask = torch.cat(masks, dim=2)
         visits_mask = torch.where(torch.sum(codes_mask, dim=-1) != 0, 1, 0)
 
-        output = self.bite_net(code_embeddings, codes_mask, visits_mask, intervals_embeddings.squeeze(2))
+        if intervals_embeddings is not None:
+            output = self.bite_net(code_embeddings, codes_mask, visits_mask, intervals_embeddings.squeeze(2))
+        else:
+            output = self.bite_net(code_embeddings, codes_mask, visits_mask)
+
         logits = self.fc(output)
 
         # obtain y_true, loss, y_prob
