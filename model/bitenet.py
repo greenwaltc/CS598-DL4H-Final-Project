@@ -176,11 +176,13 @@ class PrePostProcessingWrapper(nn.Module):
         """Calls wrapped layer with same parameters."""
 
         x, mask = inputs
+        y = self.layer_norm(x)
+
         try:
-            y = self.module((x, mask))
+            y = self.module((y, mask))
         except:
-            y = self.module(x)
-        return self.layer_norm(x + y)
+            y = self.module(y)
+        return x + y
 
 
 class MaskEnc(nn.Module):
@@ -333,7 +335,7 @@ class BiteNet(BaseModel):
             label_key: str,
             mode: str,
             embedding_dim: int = 128,
-            n_mask_enc_layers: int = 2,
+            n_mask_enc_layers: int = 1,
             n_heads: int = 4,
             dropout: float = 0.1,
             use_attn_pooling=True,
